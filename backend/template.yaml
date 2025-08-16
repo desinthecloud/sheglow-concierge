@@ -1,90 +1,114 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Transform: AWS::Serverless-2016-10-31
-Description: SheGlow Concierge - Enhanced serverless backend with security & monitoring
+Description: SheGlow Concierge — Week 3 (Auth, Profiles, Reminders, Calendar)
 
 Globals:
   Function:
-    Runtime: python3.11
-    Timeout: 30
+    Runtime: python3.12
+    Timeout: 20
     MemorySize: 256
-    Tracing: Active
+    Architectures: [x86_64]
     Environment:
       Variables:
-        TABLE_USERS: !Ref UsersTable
-        TABLE_ROUTINES: !Ref RoutinesTable
-        # CRITICAL UPDATE: New Bedrock model ID
-        BEDROCK_MODEL_ID: anthropic.claude-3-5-sonnet-20241022-v2:0
-        LOG_LEVEL: INFO
+        USERS_TABLE: !Ref UsersTable
+        ROUTINES_TABLE: !Ref RoutinesTable
         REMINDER_TOPIC_ARN: !Ref ReminderTopic
-  Api:
-    TracingEnabled: true
-
-Parameters:
-  Stage:
-    Type: String
-    Default: dev
-    AllowedValues: [dev, staging, prod]
-    Description: Deployment stage
+        SCHEDULER_ROLE_ARN: !GetAtt SchedulerToSnsRole.Arn
 
 Resources:
-  ### Enhanced DynamoDB with GSI
+  # ---------- Cognito ----------
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: sheglow-user-pool
+      UsernameAttributes: [email]
+      AutoVerifiedAttributes: [email]
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 8
+          RequireLowercase: true
+          RequireNumbers: true
+          RequireSymbols: false
+          RequireUppercase: true
+
+  UserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      UserPoolId: !Ref UserPool
+      ClientName: sheglow-client
+      GenerateSecret: false
+      ExplicitAuthFlows:
+        - ALLOW_USER_PASSWORD_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+        - ALLOW_USER_SRP_AUTH
+
+  # ---------- DynamoDB ----------
   UsersTable:
     Type: AWS::DynamoDB::Table
     Properties:
-      TableName: !Sub "sheglow-users-${AWS::StackName}"
       BillingMode: PAY_PER_REQUEST
       AttributeDefinitions:
-        - AttributeName: user_id
+        - AttributeName: userId
           AttributeType: S
       KeySchema:
-        - AttributeName: user_id
+        - AttributeName: userId
           KeyType: HASH
-      PointInTimeRecoverySpecification:
-        PointInTimeRecoveryEnabled: true
 
   RoutinesTable:
     Type: AWS::DynamoDB::Table
     Properties:
-      TableName: !Sub "sheglow-routines-${AWS::StackName}"
       BillingMode: PAY_PER_REQUEST
       AttributeDefinitions:
-        - AttributeName: user_id
+        - AttributeName: userId
           AttributeType: S
-        - AttributeName: routine_id
-          AttributeType: S
-        - AttributeName: created_at
+        - AttributeName: routineId
           AttributeType: S
       KeySchema:
-        - AttributeName: user_id
+        - AttributeName: userId
           KeyType: HASH
-        - AttributeName: routine_id
+        - AttributeName: routineId
           KeyType: RANGE
-      # Enhanced: Add GSI for better querying
-      GlobalSecondaryIndexes:
-        - IndexName: created-at-index
-          KeySchema:
-            - AttributeName: user_id
-              KeyType: HASH
-            - AttributeName: created_at
-              KeyType: RANGE
-          Projection:
-            ProjectionType: ALL
-      # Enhanced: TTL for cost optimization
-      TimeToLiveSpecification:
-        AttributeName: ttl
-        Enabled: true
-      PointInTimeRecoverySpecification:
-        PointInTimeRecoveryEnabled: true
 
-  ### Enhanced API with rate limiting
-  HttpApi:
+  # ---------- SNS ----------
+  ReminderTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      
+
+  # ---------- EventBridge Scheduler → SNS role ----------
+  SchedulerToSnsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: scheduler.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: publish-to-sns
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: sns:Publish
+                Resource: !Ref ReminderTopic
+
+  # ---------- API (HTTP API) ----------
+  SheGlowApi:
     Type: AWS::Serverless::HttpApi
     Properties:
-      StageName: v1
-      # Enhanced: Rate limiting
-      ThrottleConfig:
-        BurstLimit: 1000
-        RateLimit: 500
+      StageName: prod
+      Auth:
+        Authorizers:
+          CognitoAuthorizer:
+            JwtConfiguration:
+              issuer: !Sub "https://cognito-idp.${AWS::Region}.amazonaws.com/${UserPool}"
+              audience:
+                - !Ref UserPoolClient
+            IdentitySource: "$request.header.Authorization"
+        DefaultAuthorizer: CognitoAuthorizer
       CorsConfiguration:
         AllowMethods:
           - GET
@@ -95,205 +119,136 @@ Resources:
         AllowHeaders:
           - Content-Type
           - Authorization
-          - X-Api-Key
         AllowOrigins:
           - "*"
 
-  ### Lambda Functions with enhanced policies
-  RecommendFunction:
+  # ---------- Lambdas ----------
+  UsersFn:
     Type: AWS::Serverless::Function
     Properties:
-      CodeUri: src/recommend_routine/
-      Handler: app.lambda_handler
+      CodeUri: src/
+      Handler: users_handler.handler
       Policies:
         - DynamoDBCrudPolicy:
-            TableName: !Ref RoutinesTable
-        - DynamoDBReadPolicy:
             TableName: !Ref UsersTable
-        - Statement:
-            - Effect: Allow
-              Action:
-                - bedrock:InvokeModel
-                - bedrock:InvokeModelWithResponseStream
-              Resource: "*"
-            - Effect: Allow
-              Action:
-                - logs:CreateLogGroup
-                - logs:CreateLogStream
-                - logs:PutLogEvents
-              Resource: "*"
       Events:
-        Recommend:
+        GetMe:
           Type: HttpApi
           Properties:
-            ApiId: !Ref HttpApi
-            Path: /recommend
-            Method: POST
+            ApiId: !Ref SheGlowApi
+            Path: /users/me
+            Method: GET
+            Auth:
+              Authorizer: CognitoAuthorizer
+        PutMe:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref SheGlowApi
+            Path: /users/me
+            Method: PUT
+            Auth:
+              Authorizer: CognitoAuthorizer
 
-  RoutinesApiFunction:
+  RoutinesFn:
     Type: AWS::Serverless::Function
     Properties:
-      CodeUri: src/routines_api/
-      Handler: app.lambda_handler
+      CodeUri: src/
+      Handler: routines_handler.handler
       Policies:
         - DynamoDBCrudPolicy:
             TableName: !Ref RoutinesTable
         - Statement:
             - Effect: Allow
               Action:
-                - logs:CreateLogGroup
-                - logs:CreateLogStream
-                - logs:PutLogEvents
-              Resource: "*"
+                - scheduler:CreateSchedule
+                - scheduler:DeleteSchedule
+                - scheduler:GetSchedule
+                - scheduler:ListSchedules
+              Resource: !Sub "arn:aws:scheduler:${AWS::Region}:${AWS::AccountId}:schedule/*"
+            - Effect: Allow
+              Action: iam:PassRole
+              Resource: !GetAtt SchedulerToSnsRole.Arn
       Events:
-        GetRoutines:
-          Type: HttpApi
-          Properties:
-            ApiId: !Ref HttpApi
-            Path: /routines
-            Method: GET
         PostRoutine:
           Type: HttpApi
           Properties:
-            ApiId: !Ref HttpApi
+            ApiId: !Ref SheGlowApi
             Path: /routines
             Method: POST
+            Auth:
+              Authorizer: CognitoAuthorizer
+        ListRoutines:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref SheGlowApi
+            Path: /routines
+            Method: GET
+            Auth:
+              Authorizer: CognitoAuthorizer
+        PutRoutine:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref SheGlowApi
+            Path: /routines/{routineId}
+            Method: PUT
+            Auth:
+              Authorizer: CognitoAuthorizer
         DeleteRoutine:
           Type: HttpApi
           Properties:
-            ApiId: !Ref HttpApi
-            Path: /routines/{routine_id}
+            ApiId: !Ref SheGlowApi
+            Path: /routines/{routineId}
             Method: DELETE
-        HealthCheck:
+            Auth:
+              Authorizer: CognitoAuthorizer
+
+  SubscribeFn:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/
+      Handler: subscribe_handler.handler
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action:
+                - sns:Subscribe
+                - sns:SetSubscriptionAttributes
+              Resource: !Ref ReminderTopic
+      Events:
+        SubscribeEmail:
           Type: HttpApi
           Properties:
-            ApiId: !Ref HttpApi
-            Path: /health
-            Method: GET
+            ApiId: !Ref SheGlowApi
+            Path: /subscribe/email
+            Method: POST
+            Auth:
+              Authorizer: CognitoAuthorizer
 
-  RemindersFunction:
+  IcsFn:
     Type: AWS::Serverless::Function
     Properties:
-      CodeUri: src/reminders/
-      Handler: app.lambda_handler
-      Environment:
-        Variables:
-          REMINDER_TOPIC_ARN: !Ref ReminderTopic
+      CodeUri: src/
+      Handler: ics_handler.handler
       Policies:
         - DynamoDBReadPolicy:
             TableName: !Ref RoutinesTable
-        - Statement:
-            - Effect: Allow
-              Action:
-                - sns:Publish
-              Resource: !Ref ReminderTopic
-            - Effect: Allow
-              Action:
-                - logs:CreateLogGroup
-                - logs:CreateLogStream
-                - logs:PutLogEvents
-              Resource: "*"
-      Events:
-        DailyRule:
-          Type: Schedule
-          Properties:
-            Schedule: cron(0 12 * * ? *)
-            Name: !Sub "sheglow-daily-reminders-${AWS::StackName}"
-            Description: Trigger daily skincare reminders
-            Enabled: true
-
-  CalendarIcsFunction:
-    Type: AWS::Serverless::Function
-    Properties:
-      CodeUri: src/calendar_ics/
-      Handler: app.lambda_handler
-      Policies:
-        - DynamoDBReadPolicy:
-            TableName: !Ref RoutinesTable
-        - Statement:
-            - Effect: Allow
-              Action:
-                - logs:CreateLogGroup
-                - logs:CreateLogStream
-                - logs:PutLogEvents
-              Resource: "*"
       Events:
         GetIcs:
           Type: HttpApi
           Properties:
-            ApiId: !Ref HttpApi
+            ApiId: !Ref SheGlowApi
             Path: /calendar/ics
             Method: GET
-
-  ### SNS Topic for reminders
-  ReminderTopic:
-    Type: AWS::SNS::Topic
-    Properties:
-      TopicName: !Sub "sheglow-reminders-${AWS::StackName}"
-      DisplayName: "SheGlow Skincare Reminders"
-
-  ### Enhanced: CloudWatch Dashboard for monitoring
-  MonitoringDashboard:
-    Type: AWS::CloudWatch::Dashboard
-    Properties:
-      DashboardName: !Sub "SheGlow-${AWS::StackName}"
-      DashboardBody: !Sub |
-        {
-          "widgets": [
-            {
-              "type": "metric",
-              "properties": {
-                "metrics": [
-                  ["AWS/Lambda", "Duration", "FunctionName", "${RecommendFunction}"],
-                  ["AWS/Lambda", "Errors", "FunctionName", "${RecommendFunction}"],
-                  ["AWS/Lambda", "Invocations", "FunctionName", "${RecommendFunction}"]
-                ],
-                "period": 300,
-                "stat": "Average",
-                "region": "${AWS::Region}",
-                "title": "Recommend Function Metrics"
-              }
-            },
-            {
-              "type": "metric",
-              "properties": {
-                "metrics": [
-                  ["AWS/DynamoDB", "ConsumedReadCapacityUnits", "TableName", "${RoutinesTable}"],
-                  ["AWS/DynamoDB", "ConsumedWriteCapacityUnits", "TableName", "${RoutinesTable}"]
-                ],
-                "period": 300,
-                "stat": "Sum",
-                "region": "${AWS::Region}",
-                "title": "DynamoDB Usage"
-              }
-            }
-          ]
-        }
+            Auth:
+              Authorizer: CognitoAuthorizer
 
 Outputs:
-  ApiEndpoint:
-    Value: !Sub "https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com/v1"
-    Description: Base URL for SheGlow API
-    Export:
-      Name: !Sub "${AWS::StackName}-ApiEndpoint"
-
+  ApiUrl:
+    Value: !Sub "https://${SheGlowApi}.execute-api.${AWS::Region}.amazonaws.com/prod"
+    Description: Base URL for the SheGlow API
+  UserPoolId:
+    Value: !Ref UserPool
+  UserPoolClientId:
+    Value: !Ref UserPoolClient
   ReminderTopicArn:
     Value: !Ref ReminderTopic
-    Description: SNS Topic ARN for reminders - subscribe email/SMS here
-    Export:
-      Name: !Sub "${AWS::StackName}-ReminderTopicArn"
-
-  DashboardURL:
-    Value: !Sub "https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=SheGlow-${AWS::StackName}"
-    Description: CloudWatch Dashboard for monitoring
-
-  ApiDocumentation:
-    Value: !Sub |
-      API Endpoints:
-      - POST ${HttpApi}.execute-api.${AWS::Region}.amazonaws.com/v1/recommend
-      - GET ${HttpApi}.execute-api.${AWS::Region}.amazonaws.com/v1/routines?user_id=<user_id>
-      - POST ${HttpApi}.execute-api.${AWS::Region}.amazonaws.com/v1/routines
-      - DELETE ${HttpApi}.execute-api.${AWS::Region}.amazonaws.com/v1/routines/<routine_id>?user_id=<user_id>
-      - GET ${HttpApi}.execute-api.${AWS::Region}.amazonaws.com/v1/calendar/ics?user_id=<user_id>
-      - GET ${HttpApi}.execute-api.${AWS::Region}.amazonaws.com/v1/health
-    Description: Available API endpoints
