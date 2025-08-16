@@ -20,6 +20,7 @@ Resources:
   UserPool:
     Type: AWS::Cognito::UserPool
     Properties:
+      # (Optional) remove name to avoid collisions across envs
       UserPoolName: sheglow-user-pool
       UsernameAttributes: [email]
       AutoVerifiedAttributes: [email]
@@ -35,6 +36,7 @@ Resources:
     Type: AWS::Cognito::UserPoolClient
     Properties:
       UserPoolId: !Ref UserPool
+      # (Optional) remove name to avoid collisions across envs
       ClientName: sheglow-client
       GenerateSecret: false
       ExplicitAuthFlows:
@@ -72,13 +74,13 @@ Resources:
   # ---------- SNS ----------
   ReminderTopic:
     Type: AWS::SNS::Topic
-    Properties:
-      
+    # (No explicit TopicName to avoid collisions)
 
   # ---------- EventBridge Scheduler → SNS role ----------
   SchedulerToSnsRole:
     Type: AWS::IAM::Role
     Properties:
+      # (No explicit RoleName to avoid CAPABILITY_NAMED_IAM, use CAPABILITY_IAM instead)
       AssumeRolePolicyDocument:
         Version: '2012-10-17'
         Statement:
@@ -110,17 +112,9 @@ Resources:
             IdentitySource: "$request.header.Authorization"
         DefaultAuthorizer: CognitoAuthorizer
       CorsConfiguration:
-        AllowMethods:
-          - GET
-          - POST
-          - PUT
-          - DELETE
-          - OPTIONS
-        AllowHeaders:
-          - Content-Type
-          - Authorization
-        AllowOrigins:
-          - "*"
+        AllowMethods: [GET, POST, PUT, DELETE, OPTIONS]
+        AllowHeaders: [Content-Type, Authorization]
+        AllowOrigins: ['*']
 
   # ---------- Lambdas ----------
   UsersFn:
